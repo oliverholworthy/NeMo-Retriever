@@ -671,6 +671,7 @@ def _run_ingestion(
             caption_top_p=None,
             caption_max_tokens=1024,
             store_images_uri=None,
+            store_actors=None,
             segment_audio=False,
             audio_split_type="size",
             audio_split_interval=500000,
