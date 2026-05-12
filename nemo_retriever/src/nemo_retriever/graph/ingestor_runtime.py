@@ -768,7 +768,19 @@ def build_graph(
             table_kwargs.update(_rr)
             graphic_kwargs.update(_rr)
 
-            graph = graph >> PDFExtractionActor(**extract_kwargs) >> PageElementDetectionActor(**detect_kwargs)
+            needs_page_element_detection = bool(
+                extract_params.extract_images
+                or extract_params.extract_tables
+                or extract_params.extract_charts
+                or extract_params.extract_infographics
+                or extract_params.extract_page_as_image
+                or extract_params.page_elements_invoke_url
+                or extract_params.use_table_structure
+                or extract_params.use_graphic_elements
+            )
+            graph = graph >> PDFExtractionActor(**extract_kwargs)
+            if needs_page_element_detection:
+                graph = graph >> PageElementDetectionActor(**detect_kwargs)
             if extract_params.use_table_structure and extract_params.extract_tables:
                 graph = graph >> TableStructureActor(**table_kwargs)
             if extract_params.use_graphic_elements and extract_params.extract_charts:

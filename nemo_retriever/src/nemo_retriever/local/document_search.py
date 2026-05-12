@@ -508,10 +508,17 @@ def _detect_staleness(manifest: dict[str, Any]) -> dict[str, Any]:
             changed.append({"path": str(path), "reason": "modified"})
 
     new_supported = 0
+    input_path = Path(str(manifest.get("input_path") or ""))
     corpus_root = Path(str(manifest.get("corpus_root") or ""))
-    if corpus_root.exists() and corpus_root.is_dir():
+    if input_path.exists() and input_path.is_file():
+        candidate_paths = [input_path]
+    elif corpus_root.exists() and corpus_root.is_dir():
+        candidate_paths = list(corpus_root.rglob("*"))
+    else:
+        candidate_paths = []
+    if candidate_paths:
         indexed = {str(Path(str(doc.get("path", ""))).resolve()) for doc in manifest.get("documents", [])}
-        for path in corpus_root.rglob("*"):
+        for path in candidate_paths:
             if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS and str(path.resolve()) not in indexed:
                 new_supported += 1
 
@@ -643,6 +650,9 @@ def _run_ingestion(
             nemotron_parse_batch_size=0,
             nemotron_parse_gpus_per_actor=0.0,
         )
+        # Local document search is text-only by default; avoid extracting embedded
+        # page images unless a richer visual pipeline is requested explicitly.
+        extract_params = extract_params.model_copy(update={"extract_images": False})
         embed_params = _build_embed_params(
             embed_model_name=resolve_embed_model(embedding_model),
             embed_invoke_url=inference_config.embed_invoke_url,

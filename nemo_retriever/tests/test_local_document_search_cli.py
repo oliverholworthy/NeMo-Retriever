@@ -172,9 +172,29 @@ def test_run_ingestion_uses_graph_vdb_upload_sink(tmp_path, monkeypatch):
             return "raw-result"
 
     fake_ingestor = _FakeIngestor()
-    monkeypatch.setattr(pipeline_main, "_build_extract_params", lambda **kwargs: SimpleNamespace(kwargs=kwargs))
+
+    class _FakeExtractParams(SimpleNamespace):
+        def model_copy(self, *, update=None):
+            kwargs = {**self.kwargs, **(update or {})}
+            return _FakeExtractParams(kwargs=kwargs)
+
+    captured_extract_params = []
+
+    def fake_build_extract_params(**kwargs):
+        params = _FakeExtractParams(kwargs=kwargs)
+        captured_extract_params.append(params)
+        return params
+
+    captured_ingestor_kwargs = {}
+
+    monkeypatch.setattr(pipeline_main, "_build_extract_params", fake_build_extract_params)
     monkeypatch.setattr(pipeline_main, "_build_embed_params", lambda **kwargs: SimpleNamespace(kwargs=kwargs))
-    monkeypatch.setattr(pipeline_main, "_build_ingestor", lambda **kwargs: fake_ingestor)
+
+    def fake_build_ingestor(**kwargs):
+        captured_ingestor_kwargs.update(kwargs)
+        return fake_ingestor
+
+    monkeypatch.setattr(pipeline_main, "_build_ingestor", fake_build_ingestor)
     monkeypatch.setattr(
         pipeline_main,
         "_collect_results",
@@ -211,6 +231,8 @@ def test_run_ingestion_uses_graph_vdb_upload_sink(tmp_path, monkeypatch):
     assert summary["documents_processed"] == 1
     assert summary["chunk_count"] == 2
     assert summary["uploadable_chunks"] == 2
+    assert captured_extract_params
+    assert captured_ingestor_kwargs["extract_params"].kwargs["extract_images"] is False
     assert len(fake_ingestor.vdb_upload_params) == 1
     vdb_params = fake_ingestor.vdb_upload_params[0]
     assert vdb_params.vdb_op == "lancedb"
@@ -374,6 +396,74 @@ def test_ask_reports_reused_index_when_manifest_is_fresh(tmp_path, monkeypatch):
     assert payload["reused_index"] is True
     assert payload["indexed_now"] is False
     assert payload["reindexed"] is False
+    assert payload["reindex_reasons"] == []
+
+
+def test_ask_reuses_single_file_index_when_parent_has_other_documents(tmp_path, monkeypatch):
+    corpus = tmp_path / "docs"
+    corpus.mkdir()
+    doc = corpus / "guide.txt"
+    doc.write_text("The renewal date is May 7.", encoding="utf-8")
+    sibling = corpus / "other.txt"
+    sibling.write_text("Another document exists.", encoding="utf-8")
+    stat = doc.stat()
+    index = tmp_path / "index"
+    _write_manifest(
+        index,
+        corpus_root=corpus,
+        documents=[
+            {
+                "path": str(doc),
+                "relative_path": "guide.txt",
+                "input_type": "txt",
+                "extension": ".txt",
+                "size_bytes": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "page_count": None,
+            }
+        ],
+    )
+    manifest = json.loads((index / "manifest.json").read_text(encoding="utf-8"))
+    manifest["input_path"] = str(doc)
+    (index / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    from nemo_retriever.local import document_search
+
+    monkeypatch.setattr(
+        document_search,
+        "_table_info",
+        lambda *args, **kwargs: {
+            "readable": True,
+            "uri": str(index / "lancedb"),
+            "table": "local-documents",
+            "table_exists": True,
+            "row_count": 1,
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(document_search, "_validate_local_inference_available", lambda: None)
+    monkeypatch.setattr(
+        document_search,
+        "_run_ingestion_for_output",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected reindex")),
+    )
+
+    class _FakeRetriever:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def query(self, query, top_k):
+            return [{"text": "The renewal date is May 7.", "source_id": str(doc), "metadata": "{}"}]
+
+    monkeypatch.setitem(sys.modules, "nemo_retriever.retriever", SimpleNamespace(Retriever=_FakeRetriever))
+
+    result = RUNNER.invoke(app, ["ask", str(doc), "renewal date", "--index", str(index), "--output", "json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["resolved_input_path"] == str(doc.resolve())
+    assert payload["index_action"] == "reused"
+    assert payload["reused_index"] is True
     assert payload["reindex_reasons"] == []
 
 
