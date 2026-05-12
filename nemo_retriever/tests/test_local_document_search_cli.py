@@ -223,9 +223,12 @@ def test_search_returns_agent_readable_json(tmp_path, monkeypatch):
         },
     )
 
+    captured_retriever_kwargs = {}
+
     class _FakeRetriever:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            captured_retriever_kwargs.update(kwargs)
 
         def query(self, query, top_k):
             os.write(2, b"`torch_dtype` is deprecated! Use `dtype` instead!\n")
@@ -253,6 +256,19 @@ def test_search_returns_agent_readable_json(tmp_path, monkeypatch):
     assert payload["results"][0]["source_file"] == str(doc)
     assert payload["results"][0]["page"] == 1
     assert payload["results"][0]["chunk_text"] == "The renewal date is May 7."
+    assert "vdb" not in captured_retriever_kwargs
+    assert "embedder" not in captured_retriever_kwargs
+    assert "reranker" not in captured_retriever_kwargs
+    assert captured_retriever_kwargs["vdb_kwargs"] == {
+        "uri": str(index / "lancedb"),
+        "table_name": "local-documents",
+    }
+    assert captured_retriever_kwargs["embed_kwargs"] == {
+        "model_name": "nvidia/llama-nemotron-embed-1b-v2",
+        "embed_model_name": "nvidia/llama-nemotron-embed-1b-v2",
+        "local_ingest_embed_backend": "hf",
+    }
+    assert captured_retriever_kwargs["rerank"] is False
     updated = json.loads((index / "manifest.json").read_text(encoding="utf-8"))
     assert updated["last_query_at"] is not None
 

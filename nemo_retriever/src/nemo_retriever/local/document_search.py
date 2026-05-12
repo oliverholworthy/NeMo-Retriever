@@ -1030,15 +1030,24 @@ def _search_index(
 
     from nemo_retriever.retriever import Retriever
 
+    embed_kwargs: dict[str, Any] = {
+        "model_name": resolved_model,
+        "embed_model_name": resolved_model,
+        "local_ingest_embed_backend": "hf",
+    }
+    if inference_config.embed_invoke_url:
+        embed_kwargs["embedding_endpoint"] = inference_config.embed_invoke_url
+        embed_kwargs["embed_invoke_url"] = inference_config.embed_invoke_url
+        resolved_api_key = resolve_remote_api_key(api_key)
+        if resolved_api_key:
+            embed_kwargs["api_key"] = resolved_api_key
+
     retriever = Retriever(
-        vdb="lancedb",
+        run_mode="service" if inference_config.embed_invoke_url else "local",
         vdb_kwargs={"uri": str(_lancedb_uri(index)), "table_name": table_name},
-        embedder=resolved_model,
+        embed_kwargs=embed_kwargs,
         top_k=int(top_k),
-        embedding_endpoint=inference_config.embed_invoke_url,
-        embedding_use_grpc=False if inference_config.embed_invoke_url else None,
-        embedding_api_key=resolve_remote_api_key(api_key) or "",
-        reranker=False,
+        rerank=False,
     )
     hits = retriever.query(query, top_k=int(top_k))
     results = [_format_hit(hit, rank=i + 1, show_context=show_context) for i, hit in enumerate(hits)]
