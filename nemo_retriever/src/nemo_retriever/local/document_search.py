@@ -576,14 +576,12 @@ def _run_ingestion(
     text_chunk_max_tokens: int,
     text_chunk_overlap_tokens: int,
 ) -> dict[str, Any]:
-    from nemo_retriever.params import TextChunkParams
+    from nemo_retriever.params import TextChunkParams, VdbUploadParams
     from nemo_retriever.pipeline.__main__ import (
         _build_embed_params,
         _build_extract_params,
         _build_ingestor,
         _collect_results,
-        _count_uploadable_vdb_records,
-        _upload_vdb_records,
     )
 
     grouped = _group_documents(discovery.documents)
@@ -684,20 +682,22 @@ def _run_ingestion(
             video_frame_text_dedup_max_dropped_frames=2,
             video_av_fuse=False,
         )
-        raw_result = ingestor.ingest()
-        records, result_df, _download_secs, _input_units = _collect_results("inprocess", raw_result)
-        uploadable = _count_uploadable_vdb_records(records)
-        if uploadable:
-            _upload_vdb_records(
-                records,
-                vdb_op="lancedb",
+        before_rows = 0 if first_upload else int(_table_info(index_path, DEFAULT_LANCEDB_TABLE).get("row_count") or 0)
+        ingestor = ingestor.vdb_upload(
+            VdbUploadParams(
                 vdb_kwargs={
                     "uri": str(_lancedb_uri(index_path)),
                     "table_name": DEFAULT_LANCEDB_TABLE,
                     "overwrite": first_upload,
                     "hybrid": False,
-                },
+                }
             )
+        )
+        raw_result = ingestor.ingest()
+        _records, result_df, _download_secs, _input_units = _collect_results("inprocess", raw_result)
+        after_rows = int(_table_info(index_path, DEFAULT_LANCEDB_TABLE).get("row_count") or 0)
+        uploadable = after_rows if first_upload else max(0, after_rows - before_rows)
+        if uploadable:
             first_upload = False
             processed_paths.update(str(doc.path) for doc in docs)
 

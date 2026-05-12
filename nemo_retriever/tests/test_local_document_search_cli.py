@@ -102,6 +102,89 @@ def test_init_writes_manifest_from_ingestion_summary(tmp_path, monkeypatch):
     assert manifest["lancedb_table"] == "local-documents"
 
 
+def test_run_ingestion_uses_graph_vdb_upload_sink(tmp_path, monkeypatch):
+    corpus = tmp_path / "docs"
+    corpus.mkdir()
+    doc = corpus / "guide.txt"
+    doc.write_text("warranty limits", encoding="utf-8")
+    index = tmp_path / "index"
+
+    from nemo_retriever.local import document_search
+    from nemo_retriever.pipeline import __main__ as pipeline_main
+
+    discovery = document_search._discover_documents(
+        corpus,
+        include=[],
+        exclude=[],
+        max_docs=200,
+        max_pages=None,
+    )
+
+    class _FakeResultFrame:
+        index = [0, 1]
+
+    class _FakeIngestor:
+        def __init__(self):
+            self.vdb_upload_params = []
+
+        def vdb_upload(self, params):
+            self.vdb_upload_params.append(params)
+            return self
+
+        def ingest(self):
+            return "raw-result"
+
+    fake_ingestor = _FakeIngestor()
+    monkeypatch.setattr(pipeline_main, "_build_extract_params", lambda **kwargs: SimpleNamespace(kwargs=kwargs))
+    monkeypatch.setattr(pipeline_main, "_build_embed_params", lambda **kwargs: SimpleNamespace(kwargs=kwargs))
+    monkeypatch.setattr(pipeline_main, "_build_ingestor", lambda **kwargs: fake_ingestor)
+    monkeypatch.setattr(
+        pipeline_main,
+        "_collect_results",
+        lambda run_mode, raw_result: ([], _FakeResultFrame(), 0.0, 2),
+    )
+    monkeypatch.setattr(
+        document_search,
+        "_table_info",
+        lambda *args, **kwargs: {
+            "readable": True,
+            "uri": str(index / "lancedb"),
+            "table": "local-documents",
+            "table_exists": True,
+            "row_count": 2,
+            "error": None,
+        },
+    )
+
+    summary = document_search._run_ingestion(
+        discovery,
+        index_path=index,
+        inference_config=document_search.InferenceConfig(
+            requested="remote",
+            endpoint_mode="remote",
+            embed_invoke_url="http://localhost:8012/v1",
+            api_key_configured=False,
+        ),
+        embedding_model="nvidia/llama-nemotron-embed-1b-v2",
+        api_key=None,
+        text_chunk_max_tokens=512,
+        text_chunk_overlap_tokens=32,
+    )
+
+    assert summary["documents_processed"] == 1
+    assert summary["chunk_count"] == 2
+    assert summary["uploadable_chunks"] == 2
+    assert len(fake_ingestor.vdb_upload_params) == 1
+    vdb_params = fake_ingestor.vdb_upload_params[0]
+    assert vdb_params.vdb_op == "lancedb"
+    assert vdb_params.vdb_kwargs == {
+        "uri": str(index.resolve() / "lancedb"),
+        "table_name": "local-documents",
+        "overwrite": True,
+        "hybrid": False,
+    }
+
+
 def test_search_returns_agent_readable_json(tmp_path, monkeypatch):
     corpus = tmp_path / "docs"
     corpus.mkdir()
