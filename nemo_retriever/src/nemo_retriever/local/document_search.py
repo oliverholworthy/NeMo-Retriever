@@ -11,12 +11,12 @@ checks, and JSON output that agents can inspect without scraping prose logs.
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import json
 import os
 import shutil
 import sys
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +42,7 @@ DEFAULT_TOP_K = 5
 DEFAULT_EMBEDDING_MODEL = "nvidia/llama-nemotron-embed-1b-v2"
 DEFAULT_REMOTE_EMBED_ENDPOINT = "https://integrate.api.nvidia.com/v1/embeddings"
 MANIFEST_FILENAME = "manifest.json"
+PROGRESS_LOG_FILENAME = "local-search.log"
 
 SUPPORTED_EXTENSIONS: dict[str, str] = {
     ".pdf": "pdf",
@@ -121,6 +122,10 @@ def _lancedb_uri(index: Path) -> Path:
 
 def _manifest_path(index: Path) -> Path:
     return _resolve_index(index) / MANIFEST_FILENAME
+
+
+def _progress_log_path(index: Path) -> Path:
+    return _resolve_index(index).parent / PROGRESS_LOG_FILENAME
 
 
 def _normalize_output(output: str) -> str:
@@ -575,6 +580,7 @@ def _run_ingestion(
     api_key: str | None,
     text_chunk_max_tokens: int,
     text_chunk_overlap_tokens: int,
+    progress_log_path: Path | None = None,
 ) -> dict[str, Any]:
     from nemo_retriever.params import TextChunkParams, VdbUploadParams
     from nemo_retriever.pipeline.__main__ import (
@@ -596,6 +602,14 @@ def _run_ingestion(
     _lancedb_uri(index_path).mkdir(parents=True, exist_ok=True)
 
     for input_type, docs in sorted(grouped.items()):
+        if progress_log_path is not None:
+            _append_progress_event(
+                progress_log_path,
+                "ingest_group_start",
+                documents=len(docs),
+                input_type=input_type,
+                index_path=str(_resolve_index(index_path)),
+            )
         extract_params = _build_extract_params(
             method="pdfium",
             dpi=300,
@@ -713,6 +727,16 @@ def _run_ingestion(
                 "uploadable_chunks": uploadable,
             }
         )
+        if progress_log_path is not None:
+            _append_progress_event(
+                progress_log_path,
+                "ingest_group_complete",
+                documents=len(docs),
+                input_type=input_type,
+                rows=row_count,
+                uploadable_chunks=uploadable,
+                index_path=str(_resolve_index(index_path)),
+            )
 
     if discovery.documents and total_uploadable == 0:
         raise LocalSearchError(
@@ -755,56 +779,64 @@ def _summarize_pipeline_log(raw: str) -> list[str]:
     return warnings[-6:]
 
 
+def _progress_event_line(event: str, **fields: Any) -> str:
+    payload = {"ts": _utc_now(), "event": event, **fields}
+    return json.dumps(payload, sort_keys=True, default=str) + "\n"
+
+
+def _append_progress_event(log_path: Path, event: str, **fields: Any) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write(_progress_event_line(event, **fields))
+
+
+def _read_progress_log_since(log_path: Path, offset: int) -> str:
+    if not log_path.exists():
+        return ""
+    with log_path.open("r", encoding="utf-8", errors="replace") as log_file:
+        log_file.seek(offset)
+        return log_file.read()
+
+
 def _run_ingestion_for_output(*, output: str, **kwargs: Any) -> dict[str, Any]:
+    index_path = Path(kwargs["index_path"])
+    progress_log = _progress_log_path(index_path)
+    kwargs = {**kwargs, "progress_log_path": progress_log}
+    progress_fields = {
+        "index_path": str(_resolve_index(index_path)),
+        "progress_log_path": str(progress_log),
+    }
     if _normalize_output(output) != "json":
-        return _run_ingestion(**kwargs)
-
-    sys.stdout.flush()
-    sys.stderr.flush()
-    with tempfile.TemporaryFile() as captured:
-        old_stdout = os.dup(1)
-        old_stderr = os.dup(2)
-        error: LocalSearchError | None = None
-        result: dict[str, Any] | None = None
+        _append_progress_event(progress_log, "ingest_start", **progress_fields)
         try:
-            os.dup2(captured.fileno(), 1)
-            os.dup2(captured.fileno(), 2)
             result = _run_ingestion(**kwargs)
-        except LocalSearchError as exc:
-            error = exc
-        finally:
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os.dup2(old_stdout, 1)
-            os.dup2(old_stderr, 2)
-            os.close(old_stdout)
-            os.close(old_stderr)
-
-        captured.seek(0)
-        log_text = captured.read().decode("utf-8", errors="replace")
-
-    if error is not None:
-        warnings = error.warnings + _summarize_pipeline_log(log_text)
-        if "401 Unauthorized" in log_text and "integrate.api.nvidia.com" in log_text:
-            raise LocalSearchError(
-                "Remote embedding endpoint rejected the configured API key. "
-                "Set a valid NVIDIA_API_KEY/NGC_API_KEY, pass --api-key, or run with --inference local "
-                "from an environment that has nemo-retriever[local] installed.",
-                code="remote_embedding_unauthorized",
-                warnings=warnings,
-            ) from error
-        raise LocalSearchError(str(error), code=error.code, warnings=warnings) from error
-    assert result is not None
-    return result
-
-
-def _search_index_for_output(*, output: str, **kwargs: Any) -> dict[str, Any]:
-    if _normalize_output(output) != "json":
-        return _search_index(**kwargs)
+        except Exception as exc:
+            _append_progress_event(
+                progress_log,
+                "ingest_error",
+                error_code=getattr(exc, "code", type(exc).__name__),
+                error_message=str(exc),
+                **progress_fields,
+            )
+            raise
+        _append_progress_event(
+            progress_log,
+            "ingest_complete",
+            chunk_count=result.get("chunk_count"),
+            documents_processed=result.get("documents_processed"),
+            **progress_fields,
+        )
+        result["progress_log_path"] = str(progress_log)
+        return result
 
     sys.stdout.flush()
     sys.stderr.flush()
-    with tempfile.TemporaryFile() as captured:
+    progress_log.parent.mkdir(parents=True, exist_ok=True)
+    with progress_log.open("a+", encoding="utf-8", buffering=1) as captured:
+        captured.seek(0, os.SEEK_END)
+        log_offset = captured.tell()
+        captured.write(_progress_event_line("ingest_start", **progress_fields))
+        captured.flush()
         old_stdout = os.dup(1)
         old_stderr = os.dup(2)
         error: Exception | None = None
@@ -812,7 +844,8 @@ def _search_index_for_output(*, output: str, **kwargs: Any) -> dict[str, Any]:
         try:
             os.dup2(captured.fileno(), 1)
             os.dup2(captured.fileno(), 2)
-            result = _search_index(**kwargs)
+            with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+                result = _run_ingestion(**kwargs)
         except Exception as exc:
             error = exc
         finally:
@@ -823,8 +856,133 @@ def _search_index_for_output(*, output: str, **kwargs: Any) -> dict[str, Any]:
             os.close(old_stdout)
             os.close(old_stderr)
 
-        captured.seek(0)
-        log_text = captured.read().decode("utf-8", errors="replace")
+        if error is not None:
+            captured.write(
+                _progress_event_line(
+                    "ingest_error",
+                    error_code=getattr(error, "code", type(error).__name__),
+                    error_message=str(error),
+                    **progress_fields,
+                )
+            )
+        else:
+            assert result is not None
+            captured.write(
+                _progress_event_line(
+                    "ingest_complete",
+                    chunk_count=result.get("chunk_count"),
+                    documents_processed=result.get("documents_processed"),
+                    **progress_fields,
+                )
+            )
+        captured.flush()
+        log_text = _read_progress_log_since(progress_log, log_offset)
+
+    if error is not None:
+        captured_warnings = _summarize_pipeline_log(log_text)
+        if "401 Unauthorized" in log_text and "integrate.api.nvidia.com" in log_text:
+            raise LocalSearchError(
+                "Remote embedding endpoint rejected the configured API key. "
+                "Set a valid NVIDIA_API_KEY/NGC_API_KEY, pass --api-key, or run with --inference local "
+                "from an environment that has nemo-retriever[local] installed.",
+                code="remote_embedding_unauthorized",
+                warnings=(error.warnings if isinstance(error, LocalSearchError) else []) + captured_warnings,
+            ) from error
+        if isinstance(error, LocalSearchError):
+            raise LocalSearchError(
+                str(error),
+                code=error.code,
+                warnings=error.warnings + captured_warnings,
+            ) from error
+        if captured_warnings:
+            raise LocalSearchError(
+                str(error),
+                code=type(error).__name__,
+                warnings=captured_warnings,
+            ) from error
+        raise error
+    assert result is not None
+    result["progress_log_path"] = str(progress_log)
+    return result
+
+
+def _search_index_for_output(*, output: str, **kwargs: Any) -> dict[str, Any]:
+    index_path = Path(kwargs["index"])
+    progress_log = _progress_log_path(index_path)
+    kwargs = {**kwargs, "progress_log_path": progress_log}
+    progress_fields = {
+        "index_path": str(_resolve_index(index_path)),
+        "progress_log_path": str(progress_log),
+    }
+    if _normalize_output(output) != "json":
+        _append_progress_event(progress_log, "search_start", query=kwargs.get("query"), **progress_fields)
+        try:
+            result = _search_index(**kwargs)
+        except Exception as exc:
+            _append_progress_event(
+                progress_log,
+                "search_error",
+                error_code=getattr(exc, "code", type(exc).__name__),
+                error_message=str(exc),
+                **progress_fields,
+            )
+            raise
+        _append_progress_event(
+            progress_log,
+            "search_complete",
+            result_count=len(result.get("results") or []),
+            **progress_fields,
+        )
+        result["progress_log_path"] = str(progress_log)
+        return result
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    progress_log.parent.mkdir(parents=True, exist_ok=True)
+    with progress_log.open("a+", encoding="utf-8", buffering=1) as captured:
+        captured.seek(0, os.SEEK_END)
+        log_offset = captured.tell()
+        captured.write(_progress_event_line("search_start", query=kwargs.get("query"), **progress_fields))
+        captured.flush()
+        old_stdout = os.dup(1)
+        old_stderr = os.dup(2)
+        error: Exception | None = None
+        result: dict[str, Any] | None = None
+        try:
+            os.dup2(captured.fileno(), 1)
+            os.dup2(captured.fileno(), 2)
+            with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+                result = _search_index(**kwargs)
+        except Exception as exc:
+            error = exc
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.dup2(old_stdout, 1)
+            os.dup2(old_stderr, 2)
+            os.close(old_stdout)
+            os.close(old_stderr)
+
+        if error is not None:
+            captured.write(
+                _progress_event_line(
+                    "search_error",
+                    error_code=getattr(error, "code", type(error).__name__),
+                    error_message=str(error),
+                    **progress_fields,
+                )
+            )
+        else:
+            assert result is not None
+            captured.write(
+                _progress_event_line(
+                    "search_complete",
+                    result_count=len(result.get("results") or []),
+                    **progress_fields,
+                )
+            )
+        captured.flush()
+        log_text = _read_progress_log_since(progress_log, log_offset)
 
     captured_warnings = _summarize_pipeline_log(log_text)
     if error is not None:
@@ -844,6 +1002,7 @@ def _search_index_for_output(*, output: str, **kwargs: Any) -> dict[str, Any]:
     assert result is not None
     if captured_warnings:
         result["warnings"] = list(result.get("warnings") or []) + captured_warnings
+    result["progress_log_path"] = str(progress_log)
     return result
 
 
@@ -873,6 +1032,7 @@ def _init_payload(
         "inference": manifest["inference"],
         "groups": (ingestion or {}).get("groups", []),
         "warnings": manifest["warnings"],
+        "progress_log_path": str(_progress_log_path(index_path)),
         "next_recommended_command": next_command,
     }
 
@@ -883,6 +1043,7 @@ def _format_init_text(payload: dict[str, Any]) -> str:
         f"Documents selected: {len(payload['documents'])}",
         f"Documents processed: {payload['documents_processed']}",
         f"Chunks indexed: {payload['chunk_count']}",
+        f"Progress log: {payload['progress_log_path']}",
     ]
     if payload["warnings"]:
         lines.append("Warnings:")
@@ -1003,6 +1164,7 @@ def _search_index(
     embed_invoke_url: str | None,
     api_key: str | None,
     embedding_model: str | None,
+    progress_log_path: Path | None = None,
 ) -> dict[str, Any]:
     manifest = _load_manifest(index)
     table_name = str(manifest.get("lancedb_table") or DEFAULT_LANCEDB_TABLE)
@@ -1072,6 +1234,7 @@ def _search_index(
         },
         "results": results,
         "warnings": warnings,
+        "progress_log_path": str(progress_log_path or _progress_log_path(index)),
     }
 
 
@@ -1144,6 +1307,7 @@ def _format_search_text(payload: dict[str, Any]) -> str:
         f"Query: {payload['query']}",
         f"Index: {payload['index_metadata']['index_path']}",
         f"Results: {len(payload['results'])}",
+        f"Progress log: {payload['progress_log_path']}",
     ]
     for result in payload["results"]:
         source = result.get("source_file") or "<unknown source>"
@@ -1312,6 +1476,7 @@ def ask_documents(
         "evidence": search_payload["results"],
         "index_metadata": search_payload["index_metadata"],
         "warnings": search_payload["warnings"],
+        "progress_log_path": search_payload["progress_log_path"],
     }
 
 
@@ -1363,6 +1528,7 @@ def _format_ask_text(payload: dict[str, Any]) -> str:
     lines = [
         f"Question: {payload['query']}",
         f"Index action: {payload.get('index_action', 'unknown')}",
+        f"Progress log: {payload['progress_log_path']}",
         "Answer generation is not configured; showing retrieved evidence.",
     ]
     if payload.get("reindex_reasons"):

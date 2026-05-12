@@ -102,6 +102,43 @@ def test_init_writes_manifest_from_ingestion_summary(tmp_path, monkeypatch):
     assert manifest["lancedb_table"] == "local-documents"
 
 
+def test_init_json_writes_ingestion_progress_to_log_without_polluting_stdout(tmp_path, monkeypatch):
+    corpus = tmp_path / "docs"
+    corpus.mkdir()
+    doc = corpus / "guide.txt"
+    doc.write_text("warranty limits", encoding="utf-8")
+    index = tmp_path / ".nemo-retriever" / "local-index-test"
+    progress_log = tmp_path / ".nemo-retriever" / "local-search.log"
+
+    from nemo_retriever.local import document_search
+
+    def fake_run_ingestion(*args, **kwargs):
+        print("fake stdout progress")
+        os.write(2, b"Embedding failed: fake stderr progress\n")
+        return {
+            "documents_processed": 1,
+            "pipeline_rows": 2,
+            "uploadable_chunks": 2,
+            "chunk_count": 2,
+            "groups": [{"input_type": "txt", "documents": 1, "rows": 2, "uploadable_chunks": 2}],
+        }
+
+    monkeypatch.setattr(document_search, "_run_ingestion", fake_run_ingestion)
+
+    result = RUNNER.invoke(app, ["init", str(corpus), "--index", str(index), "--output", "json"])
+
+    assert result.exit_code == 0
+    assert "fake stdout progress" not in result.stdout
+    assert "fake stderr progress" not in result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["progress_log_path"] == str(progress_log.resolve())
+    log_text = progress_log.read_text(encoding="utf-8")
+    assert "ingest_start" in log_text
+    assert "ingest_complete" in log_text
+    assert "fake stdout progress" in log_text
+    assert "fake stderr progress" in log_text
+
+
 def test_run_ingestion_uses_graph_vdb_upload_sink(tmp_path, monkeypatch):
     corpus = tmp_path / "docs"
     corpus.mkdir()
