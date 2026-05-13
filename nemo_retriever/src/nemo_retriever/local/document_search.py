@@ -510,17 +510,27 @@ def _detect_staleness(manifest: dict[str, Any]) -> dict[str, Any]:
     new_supported = 0
     input_path = Path(str(manifest.get("input_path") or ""))
     corpus_root = Path(str(manifest.get("corpus_root") or ""))
-    if input_path.exists() and input_path.is_file():
-        candidate_paths = [input_path]
-    elif corpus_root.exists() and corpus_root.is_dir():
-        candidate_paths = list(corpus_root.rglob("*"))
-    else:
-        candidate_paths = []
-    if candidate_paths:
+    discovery_input: Path | None = None
+    if input_path.exists():
+        discovery_input = input_path
+    elif corpus_root.exists():
+        discovery_input = corpus_root
+    if discovery_input is not None:
         indexed = {str(Path(str(doc.get("path", ""))).resolve()) for doc in manifest.get("documents", [])}
-        for path in candidate_paths:
-            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS and str(path.resolve()) not in indexed:
-                new_supported += 1
+        try:
+            rediscovered = _discover_documents(
+                discovery_input,
+                include=[str(item) for item in manifest.get("include") or []],
+                exclude=[str(item) for item in manifest.get("exclude") or []],
+                max_docs=int(manifest.get("max_docs") or DEFAULT_MAX_DOCS),
+                max_pages=(int(manifest["max_pages"]) if manifest.get("max_pages") is not None else None),
+            )
+        except Exception:
+            rediscovered = None
+        if rediscovered is not None:
+            for doc in rediscovered.documents:
+                if str(doc.path.resolve()) not in indexed:
+                    new_supported += 1
 
     return {
         "stale": bool(changed or missing or new_supported),

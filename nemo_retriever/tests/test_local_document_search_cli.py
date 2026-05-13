@@ -399,6 +399,177 @@ def test_ask_reports_reused_index_when_manifest_is_fresh(tmp_path, monkeypatch):
     assert payload["reindex_reasons"] == []
 
 
+def test_ask_reuses_index_when_only_top_k_changes(tmp_path, monkeypatch):
+    corpus = tmp_path / "docs"
+    corpus.mkdir()
+    doc = corpus / "guide.txt"
+    doc.write_text("The renewal date is May 7.", encoding="utf-8")
+    stat = doc.stat()
+    index = tmp_path / "index"
+    _write_manifest(
+        index,
+        corpus_root=corpus,
+        documents=[
+            {
+                "path": str(doc),
+                "relative_path": "guide.txt",
+                "input_type": "txt",
+                "extension": ".txt",
+                "size_bytes": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "page_count": None,
+            }
+        ],
+    )
+
+    from nemo_retriever.local import document_search
+
+    monkeypatch.setattr(
+        document_search,
+        "_table_info",
+        lambda *args, **kwargs: {
+            "readable": True,
+            "uri": str(index / "lancedb"),
+            "table": "local-documents",
+            "table_exists": True,
+            "row_count": 1,
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(document_search, "_validate_local_inference_available", lambda: None)
+    monkeypatch.setattr(
+        document_search,
+        "_run_ingestion_for_output",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected reindex")),
+    )
+
+    seen_top_k = []
+
+    class _FakeRetriever:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def query(self, query, top_k):
+            seen_top_k.append(top_k)
+            return [{"text": "The renewal date is May 7.", "source_id": str(doc), "metadata": "{}"}]
+
+    monkeypatch.setitem(sys.modules, "nemo_retriever.retriever", SimpleNamespace(Retriever=_FakeRetriever))
+
+    result = RUNNER.invoke(
+        app,
+        ["ask", str(corpus), "renewal date", "--index", str(index), "--top-k", "20", "--output", "json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["index_action"] == "reused"
+    assert payload["reused_index"] is True
+    assert payload["indexed_now"] is False
+    assert payload["reindex_reasons"] == []
+    assert seen_top_k == [20]
+
+
+def test_ask_reuses_capped_index_when_only_top_k_changes(tmp_path, monkeypatch):
+    corpus = tmp_path / "docs"
+    corpus.mkdir()
+    first = corpus / "a.txt"
+    second = corpus / "b.txt"
+    overflow = corpus / "c.txt"
+    first.write_text("The renewal date is May 7.", encoding="utf-8")
+    second.write_text("The warranty limit is 30 days.", encoding="utf-8")
+    overflow.write_text("This document is intentionally outside max_docs.", encoding="utf-8")
+    index = tmp_path / "index"
+    _write_manifest(
+        index,
+        corpus_root=corpus,
+        documents=[
+            {
+                "path": str(first),
+                "relative_path": "a.txt",
+                "input_type": "txt",
+                "extension": ".txt",
+                "size_bytes": first.stat().st_size,
+                "mtime_ns": first.stat().st_mtime_ns,
+                "page_count": None,
+            },
+            {
+                "path": str(second),
+                "relative_path": "b.txt",
+                "input_type": "txt",
+                "extension": ".txt",
+                "size_bytes": second.stat().st_size,
+                "mtime_ns": second.stat().st_mtime_ns,
+                "page_count": None,
+            },
+        ],
+    )
+    manifest = json.loads((index / "manifest.json").read_text(encoding="utf-8"))
+    manifest["max_docs"] = 2
+    manifest["documents_discovered"] = 3
+    manifest["documents_skipped"] = [
+        {
+            "path": str(overflow),
+            "relative_path": "c.txt",
+            "reason": "max_docs_exceeded",
+        }
+    ]
+    (index / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    from nemo_retriever.local import document_search
+
+    monkeypatch.setattr(
+        document_search,
+        "_table_info",
+        lambda *args, **kwargs: {
+            "readable": True,
+            "uri": str(index / "lancedb"),
+            "table": "local-documents",
+            "table_exists": True,
+            "row_count": 2,
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(document_search, "_validate_local_inference_available", lambda: None)
+    monkeypatch.setattr(
+        document_search,
+        "_run_ingestion_for_output",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected reindex")),
+    )
+
+    class _FakeRetriever:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def query(self, query, top_k):
+            return [{"text": "The renewal date is May 7.", "source_id": str(first), "metadata": "{}"}]
+
+    monkeypatch.setitem(sys.modules, "nemo_retriever.retriever", SimpleNamespace(Retriever=_FakeRetriever))
+
+    result = RUNNER.invoke(
+        app,
+        [
+            "ask",
+            str(corpus),
+            "renewal date",
+            "--index",
+            str(index),
+            "--max-docs",
+            "2",
+            "--top-k",
+            "20",
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["index_action"] == "reused"
+    assert payload["reused_index"] is True
+    assert payload["indexed_now"] is False
+    assert payload["reindex_reasons"] == []
+
+
 def test_ask_reuses_single_file_index_when_parent_has_other_documents(tmp_path, monkeypatch):
     corpus = tmp_path / "docs"
     corpus.mkdir()
